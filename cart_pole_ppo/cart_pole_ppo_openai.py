@@ -175,7 +175,7 @@ class CartPolePPO:
 
 
     def learn(self):
-        obs = self.env.reset()
+        obs = self.env.reset(seed=1)
 
         ## Training
         loss_train = []
@@ -205,7 +205,7 @@ class CartPolePPO:
 
                 lentropy = -torch.mean(-log_prob_pi)
 
-                loss_policy = lclip + self.loss_entropy_coef * lentropy
+                # loss_policy = lclip + self.loss_entropy_coef * lentropy
                 loss_policy = lclip
             
                 # Opt Policy
