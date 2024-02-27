@@ -15,7 +15,8 @@ class PPO:
 
     def __init__(self, env, n_episodes = 1000, batch_size = 500, n_updates_per_ep = 10, 
                  freq_print = 10, policy_arch = [64, 64], vf_arch = [64, 64],
-                 normalize_adv = True, gamma = 0.99, policy_lr = 0.0003, vf_lr = 1e-3,
+                 normalize_adv = True, gamma = 0.99, policy_lr = 0.0003, vf_lr = 1e-3, 
+                 use_GAE = True, lambda_gae = 0.95, target_kl = 0.01,
                  ppo_clip = 0.5, loss_vf_coef = 0.5, loss_entropy_coef = 0.0, adam_eps = 1e-5):
 
         self.env = env
@@ -24,6 +25,7 @@ class PPO:
             self.discrete_action = True
             self.n_disc_action = self.env.action_space.n
         else:
+            self.discrete_action = False
             self.n_action = self.env.action_space.shape[0]
 
         self.n_episodes = n_episodes
@@ -43,6 +45,9 @@ class PPO:
         self.loss_entropy_coef = loss_entropy_coef
         self.adam_eps = adam_eps
 
+        self.lambda_gae = lambda_gae
+        self.use_GAE = use_GAE
+        self.target_kl = target_kl
         self.normalize_adv = normalize_adv
 
         self.policy_net: List[nn.Module] = []
@@ -86,7 +91,6 @@ class PPO:
 
         params = {'params': self.policy_net.parameters(), 'lr': self.policy_lr}, {'params': self.vf_net.parameters(), 'lr': self.vf_lr}
 
-        # params = list(self.policy_net.parameters()) + list(self.vf_net.parameters())
         self.opt_policy_vf = Adam(params, lr=self.policy_lr, eps=self.adam_eps)
 
 
@@ -100,12 +104,13 @@ class PPO:
         dataset_rew = []
         dataset_log_prob = []
         dataset_end = []
+        dataset_new_obs = []
 
         for t in range(self.batch_size):
             state = torch.from_numpy(obs)
 
             # Get Action
-            action_dist = Categorical(logits=self.policy_net(state))
+            action_dist = self.get_action_dist(state)
             action = action_dist.sample()
             log_prob = action_dist.log_prob(action).sum(axis=-1)
             action_np = action.numpy()
@@ -113,6 +118,7 @@ class PPO:
             new_obs, reward, done, info, _ = self.env.step(action_np)
 
             dataset_obs.append(torch.from_numpy(obs))
+            dataset_new_obs.append(torch.from_numpy(new_obs))
             dataset_act.append(action)
             dataset_rew.append(reward)
             dataset_log_prob.append(log_prob)
@@ -123,18 +129,18 @@ class PPO:
             else:
                 obs = new_obs
 
-            if t == self.batch_size - 1:
-                done = True
 
             dataset_end.append(done)
 
         dataset_obs = torch.tensor(np.array(dataset_obs), dtype=torch.float)
+        dataset_new_obs = torch.tensor(np.array(dataset_new_obs), dtype=torch.float)
         dataset_act = torch.tensor(np.array(dataset_act), dtype=torch.float)
-        dataset_rtg = self.computeRTG(dataset_rew, dataset_end)
+        dataset_rtg = self.computeRTG(dataset_rew, dataset_end, dataset_obs)
         dataset_log_prob = torch.tensor(dataset_log_prob, dtype=torch.float)
         dataset_end = torch.tensor(dataset_end, dtype=torch.float)
+        dataset_rew = torch.tensor(np.array(dataset_rew), dtype=torch.float)
 
-        return dataset_obs, dataset_act, dataset_rtg, dataset_end, dataset_log_prob
+        return dataset_obs, dataset_act, dataset_rtg, dataset_end, dataset_log_prob, dataset_new_obs, dataset_rew
 
 
 
@@ -151,25 +157,54 @@ class PPO:
         if self.discrete_action:
             action_dist = Categorical(logits=self.policy_net(obs))
         else:
-            action_dist_dist = 0
+            action_values = self.policy_net(obs)
+            mean_action = torch.mean(action_values)
+            std_action = torch.std(action_values)
+            action_dist = Normal(mean_action, std_action)
 
         return action_dist
     
 
-    def computeRTG(self, batch_rew, batch_end):
+    def computeRTG(self, batch_rew, batch_end, batch_obs):
         
         dataset_rtg = []
 
         for i in reversed(range(len(batch_rew))):
             
-            if i == len(batch_rew)-1 or batch_end[i]:
+            if batch_end[i]:
                 dataset_rtg.insert(0, batch_rew[i])
+
+            elif i == len(batch_rew)-1:
+                dataset_rtg.insert(0, self.vf_net(batch_obs[i]).detach().numpy()[0])
             
             else:
                 dataset_rtg.insert(0, batch_rew[i] + self.gamma * dataset_rtg[0])
 
         dataset_rtg = torch.tensor(dataset_rtg, dtype=torch.float)
         return dataset_rtg
+    
+
+    def computeGAE(self, dataset_obs, dataset_new_obs, dataset_rew, dataset_end):
+
+        adv = []
+
+        vf = self.vf_net(dataset_obs).squeeze()
+        vf_next = self.vf_net(dataset_new_obs).squeeze()
+
+        with torch.no_grad():
+            for i in reversed(range(len(dataset_obs))):
+            
+                if dataset_end[i]:
+                    adv.insert(0, dataset_rew[i] - vf[i])
+
+                elif i == len(dataset_rew)-1:
+                    adv.insert(0, dataset_rew[i] + self.gamma * vf_next[i] - vf[i])
+
+                else:
+                    adv.insert(0, dataset_rew[i] + self.gamma * vf_next[i] - vf[i] + self.gamma * self.lambda_gae * adv[0])
+
+        adv = torch.tensor(adv, dtype=torch.float)
+        return vf, adv
 
 
     def learn(self):
@@ -177,28 +212,47 @@ class PPO:
         self.loss_train = []
         self.rtg_train = []
         self.vf_train = []
-
+        self.approx_kl_train = []
+        self.adv_train = []
+        self.loss_train = []
+        self.loss_entropy_train = []
+        self.loss_vf_train = []
+        self.lclip_train = []
 
         for ep in range(self.n_episodes):
-            dataset_obs, dataset_act, dataset_rtg, dataset_end, dataset_log_prob = self.buildDataset() 
+            dataset_obs, dataset_act, dataset_rtg, dataset_end, dataset_log_prob, dataset_new_obs, dataset_rew = self.buildDataset() 
 
             old_log_prob_pi = dataset_log_prob
 
-            loss_updates = []
-            for it in range(self.n_updates_per_ep):
-               
-                vf_value = self.vf_net(dataset_obs).squeeze()
+            if ep == 0:
+                dataset_first_obs = dataset_obs
 
-                adv = dataset_rtg - vf_value
+            approx_kl_updates = []
+            adv_updates = []
+            loss_updates = []
+            loss_entropy_updates = []
+            loss_vf_updates = []
+            lclip_updates = []
+
+            for it in range(self.n_updates_per_ep):
+
+                if self.use_GAE:
+                    _, adv = self.computeGAE(dataset_obs, dataset_new_obs, dataset_rew, dataset_end)
+                    vf_value = self.vf_net(dataset_obs).squeeze()
+                    vf_compare = dataset_rtg
+                else:
+                    vf_value = self.vf_net(dataset_obs).squeeze()
+                    adv = dataset_rtg - vf_value.detach()
+                    vf_compare = dataset_rtg
 
                 if self.normalize_adv:
                     adv = (adv - adv.mean()) / (adv.std() + 1e-10)
 
-                # action_dist = Categorical(logits=self.policy_net(dataset_obs))
                 action_dist = self.get_action_dist(dataset_obs)
                 log_prob_pi = action_dist.log_prob(dataset_act)
+                log_ratio = log_prob_pi - old_log_prob_pi
 
-                ratio_pi = torch.exp(log_prob_pi - old_log_prob_pi)
+                ratio_pi = torch.exp(log_ratio)
 
                 ###
                 lclip_p1 = adv * ratio_pi
@@ -208,9 +262,8 @@ class PPO:
                 lentropy = -torch.mean(-adv)
 
                 ###
+                loss_vf = self.loss_vf_fn(vf_value, vf_compare)
 
-                loss_vf = self.loss_vf_fn(vf_value, dataset_rtg)
-                
                 ##
                 loss_policy_vf = lclip + self.loss_vf_coef * loss_vf + self.loss_entropy_coef * lentropy       
 
@@ -219,20 +272,35 @@ class PPO:
                 loss_policy_vf.backward()
                 self.opt_policy_vf.step()
 
-                loss_updates.append(loss_vf.detach().numpy())
+                loss_updates.append(loss_policy_vf.detach().numpy())
+                adv_updates.append(adv.detach().numpy())
+                lclip_updates.append(lclip.detach().numpy())
+                loss_vf_updates.append(loss_vf.detach().numpy())
+                loss_entropy_updates.append(lentropy.detach().numpy())
 
+                with torch.no_grad():
+
+                    approx_kl = torch.mean((torch.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_updates.append(approx_kl)
+                
+                if approx_kl > 1.5 * self.target_kl:
+                    # print(f'Approx KL {approx_kl}, early stop')
+                    break
+            
+
+            self.adv_train.append(np.mean(np.array(adv_updates)))
+            
             self.loss_train.append(np.mean(np.array(loss_updates)))
+            self.lclip_train.append(np.mean(np.array(lclip_updates)))
+            self.loss_vf_train.append(np.mean(np.array(loss_vf_updates)))
+            self.loss_entropy_train.append(np.mean(np.array(loss_entropy_updates)))
+
             self.rtg_train.append(np.mean(dataset_rtg.numpy()))
             self.vf_train.append(np.mean(vf_value.detach().numpy()))
+            self.approx_kl_train.append(approx_kl_updates)
+            self.adv_train.append(adv_updates)
 
             if ep % self.freq_print == 0:
-                print(f'Loss ep {ep}: {self.loss_train[-1]:.3f} | Avg RTG: {self.rtg_train[-1]:.3f}')
+                print(f'Loss ep {ep}: {self.loss_train[-1]:.3f} | Lclip: {self.lclip_train[-1]:.3f} | Lvf: {self.loss_vf_train[-1]:.3f} | Lent: {self.loss_entropy_train[-1]:.3f}  | Avg RTG: {self.rtg_train[-1]:.3f}')
 
-        print(f'Final Training Loss: {self.loss_train[-1]:.3f} | Avg RTG: {self.rtg_train[-1]:.3f}')
-
-
-# env = gym.make("CartPole-v1", render_mode="human")
-# ppo_teste = PPO(env, n_episodes = 10, batch_size = 50)
-# ppo_teste.learn()
-
-# print(12)
+        print(f'Final Training Loss: {self.loss_train[-1]:.3f} | Lclip: {self.lclip_train[-1]:.3f} | Lvf: {self.loss_vf_train[-1]:.3f} | Lent: {self.loss_entropy_train[-1]:.3f}  | Avg RTG: {self.rtg_train[-1]:.3f}')
