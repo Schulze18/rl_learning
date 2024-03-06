@@ -1,8 +1,10 @@
-from PPO import PPO
 import gymnasium as gym
 
+from PPO import PPO
+
 env = gym.make("CartPole-v1")
-ppo_test = PPO(env, n_episodes = 100, batch_size = 500, 
+
+ppo_test = PPO(env, n_episodes = 200, batch_size = 500, 
                n_updates_per_ep = 20, ppo_clip=0.2,
                loss_vf_coef = 0.5, lambda_gae = 0.9)
 ppo_test.learn()
